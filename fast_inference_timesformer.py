@@ -44,6 +44,9 @@ import os
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import PIL.Image
+from joblib import Parallel, delayed
+import multiprocessing
+
 PIL.Image.MAX_IMAGE_PIXELS = 933120000
 print(f"Using {torch.cuda.device_count()} GPUs")
 
@@ -115,24 +118,31 @@ cfg_init(CFG)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+def read_img(path):
+    image = cv2.imread(path, 0)
+    pad0 = (256 - image.shape[0] % 256)
+    pad1 = (256 - image.shape[1] % 256)
+    image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
+    image=np.clip(image,0,200)
+    return image
+
 def read_image_mask(start_idx,end_idx):
     images = []
     idxs = range(start_idx, end_idx)
+    paths = []
     for i in idxs:
-        print("try read", f"{args.layer_path}/{i:02}")
-        fragment_path = f"{args.layer_path}/{i:02}"
-        if os.path.exists(f"{fragment_path}.tif"):
-            image = cv2.imread(f"{fragment_path}.tif", 0)
-            image = image[5000:6000,3500:4500]
-            # image = cv2.resize(image, None, fx=2,fy=2, interpolation=cv2.INTER_CUBIC)
+        print("loading", f"{args.layer_path}/{i:02}")
+        path = f"{args.layer_path}/{i:02}"
+        if os.path.exists(f"{path}.tif"):
+            paths.append(f"{path}.tif")
         else:
-            image = cv2.imread(f"{fragment_path}.jpg", 0)
-        print(image.shape)
-        pad0 = (256 - image.shape[0] % 256)
-        pad1 = (256 - image.shape[1] % 256)
-        image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
-        image=np.clip(image,0,200)
-        images.append(image)
+            paths.append(f"{path}.jpg")
+        assert(os.path.exists(paths[-1]))
+
+    images = Parallel(n_jobs=-1)(delayed(read_img)(path) for path in paths)
+
+    print("done loading")
+    
     images = np.stack(images, axis=2)
 
     return images
@@ -305,7 +315,7 @@ def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
         # images = F.interpolate(images[:, 0], scale_factor=2, mode='bicubic').unsqueeze(1)
         # images = torch.nn.functional.layer_norm(images, images.shape[-2:])*CFG.in_chans
         
-        with torch.no_grad():
+        with torch.inference_mode():
             with torch.autocast(device_type="cuda"):
                 y_preds = model(images)
         y_preds = torch.sigmoid(y_preds)  # Keep predictions on GPU
