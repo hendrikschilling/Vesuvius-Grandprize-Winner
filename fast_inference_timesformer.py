@@ -65,7 +65,7 @@ class CFG:
     
     exp_name = 'pretraining_all'
     # ============== model cfg =============
-    in_chans = 26 # 65
+    in_chans = 21 # 65
     encoder_depth=5
     # ============== training cfg =============
     size = 64
@@ -78,6 +78,8 @@ class CFG:
 
     scheduler = 'GradualWarmupSchedulerV2'
     epochs = 50 # 30
+    
+    src_sd = 2
 
     # adamW warmupあり
     warmup_factor = 10
@@ -87,14 +89,14 @@ class CFG:
     num_workers = 16 * args.gpus
     seed = 42
     # ============== augmentation =============
-    valid_aug_list = [
-        A.Resize(size, size),
-        A.Normalize(
-            mean= [0] * in_chans,
-            std= [1] * in_chans
-        ),
-        ToTensorV2(transpose_mask=True),
-    ]
+    # valid_aug_list = [
+    #     A.Resize(size, src_sd*size),
+    #     A.Normalize(
+    #         mean= [0] * in_chans,
+    #         std= [1] * in_chans
+    #     ),
+    #     ToTensorV2(transpose_mask=True),
+    # ]
 def set_seed(seed=None, cudnn_deterministic=True):
     if seed is None:
         seed = 42
@@ -122,7 +124,7 @@ def read_image_mask(start_idx,end_idx):
         if os.path.exists(f"{fragment_path}.tif"):
             image = cv2.imread(f"{fragment_path}.tif", 0)
             image = image[5000:6000,3500:4500]
-            image = cv2.resize(image, None, fx=2,fy=2, interpolation=cv2.INTER_CUBIC)
+            # image = cv2.resize(image, None, fx=2,fy=2, interpolation=cv2.INTER_CUBIC)
         else:
             image = cv2.imread(f"{fragment_path}.jpg", 0)
         print(image.shape)
@@ -141,16 +143,18 @@ def get_img_splits(s,e):
 
     image = read_image_mask(s,e)
 
-    x1_list = list(range(0, image.shape[1]-CFG.tile_size+1, CFG.stride))
-    y1_list = list(range(0, image.shape[0]-CFG.tile_size+1, CFG.stride))
+    SD = CFG.src_sd
+
+    x1_list = list(range(0, image.shape[1]*SD-CFG.tile_size+1, CFG.stride))
+    y1_list = list(range(0, image.shape[0]*SD-CFG.tile_size+1, CFG.stride))
     for y1 in y1_list:
         for x1 in x1_list:
             y2 = y1 + CFG.tile_size
             x2 = x1 + CFG.tile_size
-            images.append(image[y1:y2, x1:x2])
+            images.append(image[y1//SD:y2//SD, x1//SD:x2//SD])
             xyxys.append([x1, y1, x2, y2])
     test_dataset = CustomDatasetTest(images,np.stack(xyxys), CFG,transform=A.Compose([
-        A.Resize(CFG.size, CFG.size),
+        A.Resize(CFG.size, CFG.size, interpolation=cv2.INTER_CUBIC),
         A.Normalize(
             mean= [0] * CFG.in_chans,
             std= [1] * CFG.in_chans
@@ -163,7 +167,7 @@ def get_img_splits(s,e):
                               shuffle=False,
                               num_workers=CFG.num_workers, pin_memory=(args.gpus==1), drop_last=False,
                               )
-    return test_loader, np.stack(xyxys),(image.shape[0],image.shape[1])
+    return test_loader, np.stack(xyxys),(image.shape[0]*SD,image.shape[1]*SD)
 
 def get_transforms(data, cfg):
     if data == 'valid':
@@ -296,6 +300,11 @@ def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
     for step, (images, xys) in tqdm(enumerate(test_loader), total=len(test_loader)):
         images = images.to(device)
         batch_size = images.size(0)
+        
+        # assert(images.shape[1] == 1)
+        # images = F.interpolate(images[:, 0], scale_factor=2, mode='bicubic').unsqueeze(1)
+        # images = torch.nn.functional.layer_norm(images, images.shape[-2:])*CFG.in_chans
+        
         with torch.no_grad():
             with torch.autocast(device_type="cuda"):
                 y_preds = model(images)
@@ -328,7 +337,7 @@ if __name__ == "__main__":
     img_split = get_img_splits(args.start_idx,args.stop_idx)
     test_loader,test_xyxz,test_shape = img_split
     
-    mask_pred = predict_fn(test_loader, model, device, test_xyxz,test_shape)
+    mask_pred = predict_fn(test_loader, model, device, test_xyxz, test_shape)
     
     mask_pred = np.clip(np.nan_to_num(mask_pred),a_min=0,a_max=1)
     mask_pred /= mask_pred.max()
