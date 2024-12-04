@@ -4,12 +4,12 @@ from tap import Tap
 import glob
 
 class InferenceArgumentParser(Tap):
-    segment_id: list[str] =[]           # Leave empty to process all segments in the segment_path
-    segment_path:str='./eval_scrolls'
-    model_path:str= 'outputs/vesuvius/pretraining_all/vesuvius-models/valid_20230827161847_0_fr_i3depoch=7.ckpt'
-    out_path:str=""
+    layer_path:str
+    model_path:str
+    out_path:str
     stride: int = 2
-    start_idx:int=15
+    start_idx:int=0
+    stop_idx:int=21
     workers: int = 4
     batch_size: int = 64
     size:int=64
@@ -30,8 +30,6 @@ from torch.nn import DataParallel
 import torch.nn.functional as F
 from timesformer_pytorch import TimeSformer
 import torch
-from warmup_scheduler import GradualWarmupScheduler
-import wandb
 import random
 import gc
 import pytorch_lightning as pl
@@ -40,7 +38,6 @@ from torch.utils.data import DataLoader
 import numpy as np
 import segmentation_models_pytorch as smp
 from tqdm.auto import tqdm
-from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 import cv2
 import os
@@ -116,53 +113,33 @@ cfg_init(CFG)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def read_image_mask(fragment_id,start_idx=18,end_idx=38,rotation=0):
+def read_image_mask(start_idx,end_idx):
     images = []
     idxs = range(start_idx, end_idx)
-
     for i in idxs:
-        fragment_path = f"{args.segment_path}/{fragment_id}/layers/{i:02}"
+        print("try read", f"{args.layer_path}/{i:02}")
+        fragment_path = f"{args.layer_path}/{i:02}"
         if os.path.exists(f"{fragment_path}.tif"):
             image = cv2.imread(f"{fragment_path}.tif", 0)
+            image = image[5000:6000,3500:4500]
+            image = cv2.resize(image, None, fx=2,fy=2, interpolation=cv2.INTER_CUBIC)
         else:
             image = cv2.imread(f"{fragment_path}.jpg", 0)
+        print(image.shape)
         pad0 = (256 - image.shape[0] % 256)
         pad1 = (256 - image.shape[1] % 256)
         image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
         image=np.clip(image,0,200)
         images.append(image)
     images = np.stack(images, axis=2)
-    if any(id_ in fragment_id for id_ in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']):
-        print("Reverse Segment")
-        images=images[:,:,::-1]
-    fragment_mask=None
-    wildcard_path_mask = f'{args.segment_path}/{fragment_id}/*_mask.png'
-    if os.path.exists(f'{args.segment_path}/{fragment_id}/{fragment_id}_mask.png'):
-        fragment_mask=cv2.imread(f"{args.segment_path}/{fragment_id}/{fragment_id}_mask.png", 0)
-        fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
-    elif len(glob.glob(wildcard_path_mask)) > 0:
-        # any *mask.png exists
-        mask_path = glob.glob(wildcard_path_mask)[0]
-        fragment_mask = cv2.imread(mask_path, 0)
-        fragment_mask = np.pad(fragment_mask, [(0, pad0), (0, pad1)], constant_values=0)
-    else:
-        # White mask
-        fragment_mask = np.ones_like(images[:,:,0]) * 255
 
-    return images, fragment_mask
+    return images
 
-def get_img_splits(fragment_id,s,e,rotation=0):
+def get_img_splits(s,e):
     images = []
     xyxys = []
-    if not os.path.exists(f"{args.segment_path}/{fragment_id}"):
-        fragment_id = fragment_id + "_superseded"
-    print('reading ',fragment_id)
-    # check for superseded fragment
-    try:
-        image,fragment_mask = read_image_mask(fragment_id, s,e,rotation)
-    except Exception as e:
-        print("aborted reading fragment", fragment_id, e)
-        return None
+
+    image = read_image_mask(s,e)
 
     x1_list = list(range(0, image.shape[1]-CFG.tile_size+1, CFG.stride))
     y1_list = list(range(0, image.shape[0]-CFG.tile_size+1, CFG.stride))
@@ -170,9 +147,8 @@ def get_img_splits(fragment_id,s,e,rotation=0):
         for x1 in x1_list:
             y2 = y1 + CFG.tile_size
             x2 = x1 + CFG.tile_size
-            if not np.any(fragment_mask[y1:y2, x1:x2]==0):
-                images.append(image[y1:y2, x1:x2])
-                xyxys.append([x1, y1, x2, y2])
+            images.append(image[y1:y2, x1:x2])
+            xyxys.append([x1, y1, x2, y2])
     test_dataset = CustomDatasetTest(images,np.stack(xyxys), CFG,transform=A.Compose([
         A.Resize(CFG.size, CFG.size),
         A.Normalize(
@@ -187,7 +163,7 @@ def get_img_splits(fragment_id,s,e,rotation=0):
                               shuffle=False,
                               num_workers=CFG.num_workers, pin_memory=(args.gpus==1), drop_last=False,
                               )
-    return test_loader, np.stack(xyxys),(image.shape[0],image.shape[1]),fragment_mask
+    return test_loader, np.stack(xyxys),(image.shape[0],image.shape[1])
 
 def get_transforms(data, cfg):
     if data == 'valid':
@@ -267,42 +243,42 @@ class RegressionPLModel(pl.LightningModule):
         self.log("val/MSE_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
         return {"loss": loss1}
     
-    def configure_optimizers(self):
+#     def configure_optimizers(self):
+# 
+#         optimizer = AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=CFG.lr)
+#     
+#         scheduler = get_scheduler(CFG, optimizer)
+#         return [optimizer],[scheduler]
 
-        optimizer = AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=CFG.lr)
-    
-        scheduler = get_scheduler(CFG, optimizer)
-        return [optimizer],[scheduler]
-
-class GradualWarmupSchedulerV2(GradualWarmupScheduler):
-    """
-    https://www.kaggle.com/code/underwearfitting/single-fold-training-of-resnet200d-lb0-965
-    """
-    def __init__(self, optimizer, multiplier, total_epoch, after_scheduler=None):
-        super(GradualWarmupSchedulerV2, self).__init__(
-            optimizer, multiplier, total_epoch, after_scheduler)
-
-    def get_lr(self):
-        if self.last_epoch > self.total_epoch:
-            if self.after_scheduler:
-                if not self.finished:
-                    self.after_scheduler.base_lrs = [
-                        base_lr * self.multiplier for base_lr in self.base_lrs]
-                    self.finished = True
-                return self.after_scheduler.get_lr()
-            return [base_lr * self.multiplier for base_lr in self.base_lrs]
-        if self.multiplier == 1.0:
-            return [base_lr * (float(self.last_epoch) / self.total_epoch) for base_lr in self.base_lrs]
-        else:
-            return [base_lr * ((self.multiplier - 1.) * self.last_epoch / self.total_epoch + 1.) for base_lr in self.base_lrs]
-
-def get_scheduler(cfg, optimizer):
-    scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 10, eta_min=1e-6)
-    scheduler = GradualWarmupSchedulerV2(
-        optimizer, multiplier=1.0, total_epoch=1, after_scheduler=scheduler_cosine)
-
-    return scheduler
+# class GradualWarmupSchedulerV2(GradualWarmupScheduler):
+#     """
+#     https://www.kaggle.com/code/underwearfitting/single-fold-training-of-resnet200d-lb0-965
+#     """
+#     def __init__(self, optimizer, multiplier, total_epoch, after_scheduler=None):
+#         super(GradualWarmupSchedulerV2, self).__init__(
+#             optimizer, multiplier, total_epoch, after_scheduler)
+# 
+#     def get_lr(self):
+#         if self.last_epoch > self.total_epoch:
+#             if self.after_scheduler:
+#                 if not self.finished:
+#                     self.after_scheduler.base_lrs = [
+#                         base_lr * self.multiplier for base_lr in self.base_lrs]
+#                     self.finished = True
+#                 return self.after_scheduler.get_lr()
+#             return [base_lr * self.multiplier for base_lr in self.base_lrs]
+#         if self.multiplier == 1.0:
+#             return [base_lr * (float(self.last_epoch) / self.total_epoch) for base_lr in self.base_lrs]
+#         else:
+#             return [base_lr * ((self.multiplier - 1.) * self.last_epoch / self.total_epoch + 1.) for base_lr in self.base_lrs]
+# 
+# def get_scheduler(cfg, optimizer):
+#     scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+#         optimizer, 10, eta_min=1e-6)
+#     scheduler = GradualWarmupSchedulerV2(
+#         optimizer, multiplier=1.0, total_epoch=1, after_scheduler=scheduler_cosine)
+# 
+#     return scheduler
 
 def scheduler_step(scheduler, avg_val_loss, epoch):
     scheduler.step(epoch)
@@ -346,73 +322,16 @@ import gc
 if __name__ == "__main__":
     # Loading the model
     model = RegressionPLModel.load_from_checkpoint(args.model_path, strict=False)
-    if args.gpus > 1:
-        model = DataParallel(model)  # Wrap model with DataParallel for multi-GPU
     model.to(device)
     model.eval()
-    wandb.init(
-        project="Vesuvius", 
-        name=f"ALL_scrolls_tta", 
-        )
 
-    # Set up segments
-    if len(args.segment_id) == 0:
-        args.segment_id = [os.path.basename(x) for x in glob.glob(f"{args.segment_path}/*") if os.path.isdir(x)]
-        # Sort the segment IDs
-        args.segment_id.sort()
-        print(f"Found {len(args.segment_id)} segments: {args.segment_id}")
+    img_split = get_img_splits(args.start_idx,args.stop_idx)
+    test_loader,test_xyxz,test_shape = img_split
+    
+    mask_pred = predict_fn(test_loader, model, device, test_xyxz,test_shape)
+    
+    mask_pred = np.clip(np.nan_to_num(mask_pred),a_min=0,a_max=1)
+    mask_pred /= mask_pred.max()
 
-    try:
-        for fragment_id in args.segment_id:
-            preds=[]
-            try:
-                for r in [0]:
-                    for i in [17]:
-                        start_f=i
-                        end_f=start_f+CFG.in_chans
-                        img_split = get_img_splits(fragment_id,start_f,end_f,r)
-                        if img_split is None:
-                            continue
-                        test_loader,test_xyxz,test_shape,fragment_mask = img_split
-                        mask_pred = predict_fn(test_loader, model, device, test_xyxz,test_shape)
-                        mask_pred = np.clip(np.nan_to_num(mask_pred),a_min=0,a_max=1)
-                        mask_pred /= mask_pred.max()
-
-                        preds.append(mask_pred)
-
-                        if len(args.out_path) > 0:
-                            # CV2 image
-                            image_cv = (mask_pred * 255).astype(np.uint8)
-                            try:
-                                os.makedirs(args.out_path,exist_ok=True)
-                            except:
-                                pass
-                            cv2.imwrite(os.path.join(args.out_path, f"{fragment_id}_prediction_rotated_{r}_layer_{i}.png"), image_cv)
-                        del mask_pred
-                if len(preds) > 0:
-                    img=wandb.Image(
-                    preds[0], 
-                    caption=f"{fragment_id}"
-                    )
-                    wandb.log({'predictions':img})
-                    gc.collect()
-            except Exception as e:
-                print(f"Failed to process {fragment_id}: {e}")
-    except Exception as e:
-        print(f"Final Exception: {e}")
-    finally:
-        try:
-            del test_loader
-        except:
-            pass
-        torch.cuda.empty_cache()
-        gc.collect()
-        wandb.finish()
-
-        # Explicitly shut down the DataParallel model
-        if isinstance(model, DataParallel):
-            model = model.module  # Extract the original model
-        model.cpu()  # Move the model to CPU
-        del model  # Delete the model to free up GPU memory
-
-        torch.cuda.empty_cache()  # Clean up GPU memory again
+    image_cv = (mask_pred * 255).astype(np.uint8)
+    cv2.imwrite(args.out_path, image_cv)
