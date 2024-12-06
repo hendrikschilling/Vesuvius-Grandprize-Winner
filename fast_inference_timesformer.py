@@ -252,7 +252,8 @@ def scheduler_step(scheduler, avg_val_loss, epoch):
 def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
     if args.median:
         sub_steps = (CFG.tile_size//CFG.stride)
-        mask_pred = np.zeros([sub_steps]+list(pred_shape))
+        print("sub steps", sub_steps)
+        mask_pred = np.zeros([sub_steps*sub_steps]+list(pred_shape))
     else:
         mask_pred = np.zeros(pred_shape)
         mask_count = np.zeros(pred_shape)
@@ -277,8 +278,8 @@ def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
         # Update mask_pred and mask_count in a batch manner
         for i, (x1, y1, x2, y2) in enumerate(xys):
             if args.median:
-                subx = (x1//16) % sub_steps
-                suby = (y1//16) % sub_steps
+                subx = (x1//CFG.stride) % sub_steps
+                suby = (y1//CFG.stride) % sub_steps
                 mask_pred[suby*sub_steps+subx, y1//16:y2//16, x1//16:x2//16] = y_preds_multiplied_cpu[i]
             else:
                 mask_pred[y1//16:y2//16, x1//16:x2//16] += y_preds_multiplied_cpu[i]
