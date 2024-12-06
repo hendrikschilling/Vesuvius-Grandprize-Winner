@@ -56,3 +56,16 @@ python inference_timesformer.py --segment_id 20231210121321 20231221180251 --seg
 ```
 
 The optional parameter ```--out_path``` can be used to specify the output path of the predictions.
+
+# Alternative faster inference
+
+```bash
+python fast_inference_timesformer.py --layer_path <dir> --model_path <model>.ckpt --out_path ink_outer.jpg --compile 1 --quality 0
+```
+
+Faster inference variant that can be more than 10x faster or higher quality, but always renders to the native network output resolution, skipping the original upscaling.
+Flags:
+--compile, uses torch.compile for ~60% speedup
+--quality 0-3, default 1, adjusts the stride for more oversampling. 2 should be better than GP baseline, 1 a bit faster and still good
+--crop x y w h -
+--reverse - reverse the layer order, try if ink detection doesn't seem to work at all
