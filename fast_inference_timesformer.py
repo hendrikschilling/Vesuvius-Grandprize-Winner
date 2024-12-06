@@ -14,8 +14,8 @@ class InferenceArgumentParser(Tap):
     batch_size: int = 64
     size:int=64
     crop:tuple[int,int,int,int]=None
-    reverse:int=0
-    compile:int=1
+    reverse:bool=False
+    compile:bool=False
     device:str='cuda'
     gpus:int=1
     median:bool=False
