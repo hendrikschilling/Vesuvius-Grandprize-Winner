@@ -34,7 +34,7 @@ from timesformer_pytorch import TimeSformer
 import torch
 import random
 import gc
-import pytorch_lightning as pl
+from pytorch_lightning import LightningModule
 import scipy.stats as st
 from torch.utils.data import DataLoader
 import numpy as np
@@ -184,9 +184,9 @@ def get_img_splits(s,e):
     test_loader = DataLoader(test_dataset,
                               batch_size=CFG.valid_batch_size,
                               shuffle=False,
-                              num_workers=CFG.num_workers, pin_memory=(args.gpus==1), drop_last=False,
+                              num_workers=CFG.num_workers, pin_memory=False, drop_last=False,
                               )
-    return test_loader, np.stack(xyxys),(image.shape[0]*SD,image.shape[1]*SD)
+    return test_loader, np.stack(xyxys),(image.shape[0]*SD//16,image.shape[1]*SD//16)
 
 def get_transforms(data, cfg):
     if data == 'valid':
@@ -211,7 +211,7 @@ class CustomDatasetTest(Dataset):
             image = data['image'].unsqueeze(0)
         return image,xy
     
-class RegressionPLModel(pl.LightningModule):
+class RegressionPLModel(LightningModule):
     def __init__(self,pred_shape,size=64,enc='',with_norm=False):
         super(RegressionPLModel, self).__init__()
         self.save_hyperparameters()
@@ -265,43 +265,6 @@ class RegressionPLModel(pl.LightningModule):
 
         self.log("val/MSE_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
         return {"loss": loss1}
-    
-#     def configure_optimizers(self):
-# 
-#         optimizer = AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=CFG.lr)
-#     
-#         scheduler = get_scheduler(CFG, optimizer)
-#         return [optimizer],[scheduler]
-
-# class GradualWarmupSchedulerV2(GradualWarmupScheduler):
-#     """
-#     https://www.kaggle.com/code/underwearfitting/single-fold-training-of-resnet200d-lb0-965
-#     """
-#     def __init__(self, optimizer, multiplier, total_epoch, after_scheduler=None):
-#         super(GradualWarmupSchedulerV2, self).__init__(
-#             optimizer, multiplier, total_epoch, after_scheduler)
-# 
-#     def get_lr(self):
-#         if self.last_epoch > self.total_epoch:
-#             if self.after_scheduler:
-#                 if not self.finished:
-#                     self.after_scheduler.base_lrs = [
-#                         base_lr * self.multiplier for base_lr in self.base_lrs]
-#                     self.finished = True
-#                 return self.after_scheduler.get_lr()
-#             return [base_lr * self.multiplier for base_lr in self.base_lrs]
-#         if self.multiplier == 1.0:
-#             return [base_lr * (float(self.last_epoch) / self.total_epoch) for base_lr in self.base_lrs]
-#         else:
-#             return [base_lr * ((self.multiplier - 1.) * self.last_epoch / self.total_epoch + 1.) for base_lr in self.base_lrs]
-# 
-# def get_scheduler(cfg, optimizer):
-#     scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-#         optimizer, 10, eta_min=1e-6)
-#     scheduler = GradualWarmupSchedulerV2(
-#         optimizer, multiplier=1.0, total_epoch=1, after_scheduler=scheduler_cosine)
-# 
-#     return scheduler
 
 def scheduler_step(scheduler, avg_val_loss, epoch):
     scheduler.step(epoch)
@@ -309,39 +272,28 @@ def scheduler_step(scheduler, avg_val_loss, epoch):
 def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
     mask_pred = np.zeros(pred_shape)
     mask_count = np.zeros(pred_shape)
-    mask_count_kernel = np.ones((CFG.size, CFG.size))
-    kernel = gkern(CFG.size, 1)
-    kernel = kernel / kernel.max()
+    mask_count_kernel = np.ones((CFG.size//16, CFG.size//16))
     model.eval()
-
-    kernel_tensor = torch.tensor(kernel, device=device)  # Move the kernel to the GPU
 
     for step, (images, xys) in tqdm(enumerate(test_loader), total=len(test_loader)):
         images = images.to(device)
         batch_size = images.size(0)
         
-        # assert(images.shape[1] == 1)
-        # images = F.interpolate(images[:, 0], scale_factor=2, mode='bicubic').unsqueeze(1)
-        # images = torch.nn.functional.layer_norm(images, images.shape[-2:])*CFG.in_chans
         
         with torch.inference_mode():
             with torch.autocast(device_type="cuda"):
                 y_preds = model(images)
         y_preds = torch.sigmoid(y_preds)  # Keep predictions on GPU
 
-        # Resize all predictions at once
-        y_preds_resized = F.interpolate(y_preds.float(), scale_factor=16, mode='bilinear')  # Shape (batch_size, 1, 64, 64)
-        
-        # Multiply by the kernel tensor
-        y_preds_multiplied = y_preds_resized * kernel_tensor  # Broadcasting kernel to all images in the batch
-        y_preds_multiplied = y_preds_multiplied.squeeze(1)
+        y_preds = y_preds.squeeze(1)
+    
         # Move results to CPU as a NumPy array
-        y_preds_multiplied_cpu = y_preds_multiplied.cpu().numpy()  # Shape: (batch_size, 64, 64)
+        y_preds_multiplied_cpu = y_preds.cpu().numpy()  # Shape: (batch_size, 64, 64)
 
         # Update mask_pred and mask_count in a batch manner
         for i, (x1, y1, x2, y2) in enumerate(xys):
-            mask_pred[y1:y2, x1:x2] += y_preds_multiplied_cpu[i]
-            mask_count[y1:y2, x1:x2] += mask_count_kernel
+            mask_pred[y1//16:y2//16, x1//16:x2//16] += y_preds_multiplied_cpu[i]
+            mask_count[y1//16:y2//16, x1//16:x2//16] += mask_count_kernel
 
     mask_pred /= np.clip(mask_count, a_min=1, a_max=None)
     return mask_pred
