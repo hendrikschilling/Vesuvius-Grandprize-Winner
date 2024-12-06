@@ -245,27 +245,6 @@ class RegressionPLModel(LightningModule):
         x = self.backbone(torch.permute(x, (0, 2, 1,3,4)))
         x=x.view(-1,1,4,4)        
         return x
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        outputs = self(x)
-        loss1 = self.loss_func(outputs, y)
-        if torch.isnan(loss1):
-            print("Loss nan encountered")
-        self.log("train/Arcface_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
-        return {"loss": loss1}
-
-    def validation_step(self, batch, batch_idx):
-        x,y,xyxys= batch
-        batch_size = x.size(0)
-        outputs = self(x)
-        loss1 = self.loss_func(outputs, y)
-        y_preds = torch.sigmoid(outputs).to('cpu')
-        for i, (x1, y1, x2, y2) in enumerate(xyxys):
-            self.mask_pred[y1:y2, x1:x2] += F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=16,mode='bilinear').squeeze(0).squeeze(0).numpy()
-            self.mask_count[y1:y2, x1:x2] += np.ones((self.hparams.size, self.hparams.size))
-
-        self.log("val/MSE_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
-        return {"loss": loss1}
 
 def scheduler_step(scheduler, avg_val_loss, epoch):
     scheduler.step(epoch)
