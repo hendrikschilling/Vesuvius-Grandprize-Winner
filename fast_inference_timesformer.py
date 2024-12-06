@@ -13,6 +13,7 @@ class InferenceArgumentParser(Tap):
     workers: int = 4
     batch_size: int = 64
     size:int=64
+    crop:tuple[int,int,int,int]
     reverse:int=0
     compile:int=1
     device:str='cuda'
@@ -121,6 +122,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def read_img(path):
     image = cv2.imread(path, 0)
+    if not args.crop is None:
+        image = image[args.crop[1]:args.crop[1]+args.crop[3], args.crop[0]:args.crop[0]+args.crop[2]]
     pad0 = (256 - image.shape[0] % 256)
     pad1 = (256 - image.shape[1] % 256)
     image = np.pad(image, [(0, pad0), (0, pad1)], constant_values=0)
