@@ -168,8 +168,10 @@ def get_img_splits(s,e):
         for x1 in x1_list:
             y2 = y1 + CFG.tile_size
             x2 = x1 + CFG.tile_size
-            images.append(image[y1//SD:y2//SD, x1//SD:x2//SD])
-            xyxys.append([x1, y1, x2, y2])
+            tile = image[y1//SD:y2//SD, x1//SD:x2//SD]
+            if np.any(tile!=0):
+                images.append(tile)
+                xyxys.append([x1, y1, x2, y2])
     test_dataset = CustomDatasetTest(images,np.stack(xyxys), CFG,transform=A.Compose([
         A.Resize(CFG.size, CFG.size, interpolation=cv2.INTER_CUBIC),
         A.Normalize(
