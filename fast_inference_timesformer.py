@@ -7,7 +7,7 @@ class InferenceArgumentParser(Tap):
     layer_path:str
     model_path:str
     out_path:str
-    stride: int = 2
+    quality: int = 1
     start_idx:int=0
     stop_idx:int=21
     workers: int = 4
@@ -342,6 +342,10 @@ if __name__ == "__main__":
     # Loading the model
     model = RegressionPLModel.load_from_checkpoint(args.model_path, strict=False)
     model.to(device)
+    CFG.stride = CFG.tile_size // int(2**args.quality)
+    
+    print("processing quality ",args.quality, " => stride ", CFG.stride)
+    
     model.eval()
 
     img_split = get_img_splits(args.start_idx,args.stop_idx)
