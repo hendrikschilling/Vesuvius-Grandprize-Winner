@@ -13,7 +13,7 @@ class InferenceArgumentParser(Tap):
     workers: int = 4
     batch_size: int = 64
     size:int=64
-    crop:tuple[int,int,int,int]
+    crop:tuple[int,int,int,int]=None
     reverse:int=0
     compile:int=1
     device:str='cuda'
