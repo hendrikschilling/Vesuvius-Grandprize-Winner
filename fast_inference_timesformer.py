@@ -145,6 +145,9 @@ def read_image_mask(start_idx,end_idx):
 
     images = Parallel(n_jobs=-1)(delayed(read_img)(path) for path in paths)
 
+    if args.reverse:
+        images.reverse()
+
     print("done loading")
     
     images = np.stack(images, axis=2)
