@@ -14,6 +14,7 @@ class InferenceArgumentParser(Tap):
     batch_size: int = 64
     size:int=64
     reverse:int=0
+    compile:int=1
     device:str='cuda'
     gpus:int=1
 args = InferenceArgumentParser().parse_args()
@@ -342,6 +343,10 @@ if __name__ == "__main__":
     # Loading the model
     model = RegressionPLModel.load_from_checkpoint(args.model_path, strict=False)
     model.to(device)
+    
+    if args.compile:
+        model = torch.compile(model)
+        
     CFG.stride = CFG.tile_size // int(2**args.quality)
     
     print("processing quality ",args.quality, " => stride ", CFG.stride)
