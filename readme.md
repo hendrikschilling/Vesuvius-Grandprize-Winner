@@ -72,3 +72,4 @@ Flags:
 --median - use median instead of averaging to integrate strided predictions
 --sr - 1-2 increase resolution by factor (use 2 in combination with quality 2+)
 --focus - crop off borders of raw network output (1-3) without sr, 1-7 with sr, needs high quality values
+--src-sd , default 2 scaledown of the source layer images, will be scaled up on the fly for lower memory use
