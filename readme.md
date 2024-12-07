@@ -69,3 +69,6 @@ Flags:
 --quality 0-3, default 1, adjusts the stride for more oversampling. 2 should be better than GP baseline, 1 a bit faster and still good
 --crop x y w h -
 --reverse - reverse the layer order, try if ink detection doesn't seem to work at all
+--median - use median instead of averaging to integrate strided predictions
+--sr - 1-2 increase resolution by factor (use 2 in combination with quality 2+)
+--focus - crop off borders of raw network output (1-3) without sr, 1-7 with sr, needs high quality values

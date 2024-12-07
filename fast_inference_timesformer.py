@@ -17,8 +17,11 @@ class InferenceArgumentParser(Tap):
     reverse:bool=False
     compile:bool=False
     device:str='cuda'
+    sr:int=1
     gpus:int=1
     median:bool=False
+    src_sd:int=2
+    focus:int=0
 args = InferenceArgumentParser().parse_args()
 
 # Generate a string "0,1,2,...,args.gpus-1"
@@ -84,8 +87,6 @@ class CFG:
 
     scheduler = 'GradualWarmupSchedulerV2'
     epochs = 50 # 30
-    
-    src_sd = 2
 
     # adamW warmupあり
     warmup_factor = 10
@@ -161,7 +162,7 @@ def get_img_splits(s,e):
 
     image = read_image_mask(s,e)
 
-    SD = CFG.src_sd
+    SD = args.src_sd
 
     x1_list = list(range(0, image.shape[1]*SD-CFG.tile_size+1, CFG.stride))
     y1_list = list(range(0, image.shape[0]*SD-CFG.tile_size+1, CFG.stride))
@@ -187,7 +188,7 @@ def get_img_splits(s,e):
                               shuffle=False,
                               num_workers=CFG.num_workers, pin_memory=False, drop_last=False,
                               )
-    return test_loader, np.stack(xyxys),(image.shape[0]*SD//16,image.shape[1]*SD//16)
+    return test_loader, np.stack(xyxys),(image.shape[0]*SD//16*args.sr,image.shape[1]*SD//16*args.sr)
 
 def get_transforms(data, cfg):
     if data == 'valid':
@@ -246,18 +247,17 @@ class RegressionPLModel(LightningModule):
         x=x.view(-1,1,4,4)        
         return x
 
-def scheduler_step(scheduler, avg_val_loss, epoch):
-    scheduler.step(epoch)
-
 def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
+    F1 = (args.focus+1)//2
+    F2 = args.focus//2
     if args.median:
-        sub_steps = (CFG.tile_size//CFG.stride)
         print("sub steps", sub_steps)
+        sub_steps = ((CFG.tile_size//CFG.stride-F1-F2)//args.sr)
         mask_pred = np.zeros([sub_steps*sub_steps]+list(pred_shape))
     else:
         mask_pred = np.zeros(pred_shape)
         mask_count = np.zeros(pred_shape)
-        mask_count_kernel = np.ones((CFG.size//16, CFG.size//16))
+        mask_count_kernel = 1
     model.eval()
 
     for step, (images, xys) in tqdm(enumerate(test_loader), total=len(test_loader)):
@@ -270,20 +270,31 @@ def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
                 y_preds = model(images)
         y_preds = torch.sigmoid(y_preds)  # Keep predictions on GPU
 
+        if args.sr != 1:
+            y_preds = F.interpolate(y_preds.float(), scale_factor=args.sr, mode='nearest')  # Shape (batch_size, 1, 64, 64)
+
         y_preds = y_preds.squeeze(1)
-    
+        
         # Move results to CPU as a NumPy array
-        y_preds_multiplied_cpu = y_preds.cpu().numpy()  # Shape: (batch_size, 64, 64)
+        y_preds = y_preds.cpu().numpy()  # Shape: (batch_size, 64, 64)
+        
+        if F:
+            y_preds = y_preds[:,F1:-F2,F1:-F2]
+            
 
         # Update mask_pred and mask_count in a batch manner
         for i, (x1, y1, x2, y2) in enumerate(xys):
+            xs1 = x1//16*args.sr+F1
+            ys1 = y1//16*args.sr+F1
+            xs2 = x2//16*args.sr-F2
+            ys2 = y2//16*args.sr-F2
             if args.median:
-                subx = (x1//CFG.stride) % sub_steps
-                suby = (y1//CFG.stride) % sub_steps
-                mask_pred[suby*sub_steps+subx, y1//16:y2//16, x1//16:x2//16] = y_preds_multiplied_cpu[i]
+                subx = x1 % sub_steps
+                suby = y1 % sub_steps
+                mask_pred[suby*sub_steps+subx, ys1:ys2, xs1:xs2] = y_preds[i]
             else:
-                mask_pred[y1//16:y2//16, x1//16:x2//16] += y_preds_multiplied_cpu[i]
-                mask_count[y1//16:y2//16, x1//16:x2//16] += mask_count_kernel
+                mask_pred[ys1:ys2, xs1:xs2] += y_preds[i]
+                mask_count[ys1:ys2, xs1:xs2] += mask_count_kernel
                 
     if args.median:
         mask_pred = np.median(mask_pred, 0)
