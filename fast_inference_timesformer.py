@@ -278,7 +278,7 @@ def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
         # Move results to CPU as a NumPy array
         y_preds = y_preds.cpu().numpy()  # Shape: (batch_size, 64, 64)
         
-        if F:
+        if args.focus:
             y_preds = y_preds[:,F1:-F2,F1:-F2]
             
 
@@ -289,8 +289,8 @@ def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
             xs2 = x2//16*args.sr-F2
             ys2 = y2//16*args.sr-F2
             if args.median:
-                subx = x1 % sub_steps
-                suby = y1 % sub_steps
+                subx = x1//CFG.stride % sub_steps
+                suby = y1//CFG.stride % sub_steps
                 mask_pred[suby*sub_steps+subx, ys1:ys2, xs1:xs2] = y_preds[i]
             else:
                 mask_pred[ys1:ys2, xs1:xs2] += y_preds[i]
