@@ -277,9 +277,6 @@ def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
         
         # Move results to CPU as a NumPy array
         y_preds = y_preds.cpu().numpy()  # Shape: (batch_size, 64, 64)
-        
-        if F:
-            y_preds = y_preds[:,F1:-F2,F1:-F2]
             
         if args.focus > 0:
             y_preds = y_preds[:,F1:-F2,F1:-F2]
