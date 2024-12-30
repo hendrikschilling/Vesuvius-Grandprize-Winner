@@ -281,7 +281,9 @@ def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
         if F:
             y_preds = y_preds[:,F1:-F2,F1:-F2]
             
-
+        if args.focus > 0:
+            y_preds = y_preds[:,F1:-F2,F1:-F2]
+            
         # Update mask_pred and mask_count in a batch manner
         for i, (x1, y1, x2, y2) in enumerate(xys):
             xs1 = x1//16*args.sr+F1
