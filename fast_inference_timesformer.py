@@ -53,6 +53,8 @@ import PIL.Image
 from joblib import Parallel, delayed
 import multiprocessing
 
+from models.i3dallnl import InceptionI3d
+
 PIL.Image.MAX_IMAGE_PIXELS = 933120000
 print(f"Using {torch.cuda.device_count()} GPUs")
 
@@ -156,7 +158,7 @@ def read_image_mask(start_idx,end_idx):
 
     return images
 
-def get_img_splits(s,e):
+def get_img_splits(s,e,model_sd):
     images = []
     xyxys = []
 
@@ -188,7 +190,7 @@ def get_img_splits(s,e):
                               shuffle=False,
                               num_workers=CFG.num_workers, pin_memory=False, drop_last=False,
                               )
-    return test_loader, np.stack(xyxys),(image.shape[0]*SD//16*args.sr,image.shape[1]*SD//16*args.sr)
+    return test_loader, np.stack(xyxys),(image.shape[0]*SD//model_sd*args.sr,image.shape[1]*SD//model_sd*args.sr)
 
 def get_transforms(data, cfg):
     if data == 'valid':
@@ -212,7 +214,141 @@ class CustomDatasetTest(Dataset):
             data = self.transform(image=image)
             image = data['image'].unsqueeze(0)
         return image,xy
+
+class Decoder(nn.Module):
+    def __init__(self, encoder_dims, upscale):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(encoder_dims[i]+encoder_dims[i-1], encoder_dims[i-1], 3, 1, 1, bias=False),
+                nn.BatchNorm2d(encoder_dims[i-1]),
+                nn.ReLU(inplace=True)
+            ) for i in range(1, len(encoder_dims))])
+
+        self.logit = nn.Conv2d(encoder_dims[0], 1, 1, 1, 0)
+        self.up = nn.Upsample(scale_factor=upscale, mode="bilinear")
+        # for l in self.convs:
+        #     for m in l._modules:
+        #         init_weights(m)
+    def forward(self, feature_maps):
+        for i in range(len(feature_maps)-1, 0, -1):
+            f_up = F.interpolate(feature_maps[i], scale_factor=2, mode="bilinear")
+            f = torch.cat([feature_maps[i-1], f_up], dim=1)
+            f_down = self.convs[i-1](f)
+            feature_maps[i-1] = f_down
+
+        x = self.logit(feature_maps[0])
+        mask = self.up(x)
+        return mask
+
+class RegressionPLManyModels(LightningModule):
+    def __init__(self,pred_shape,size=224,enc='',with_norm=False):
+        super(RegressionPLManyModels, self).__init__()
+
+        self.output_sd = 4
+        self.save_hyperparameters()
+        self.mask_pred = np.zeros(self.hparams.pred_shape)
+        self.mask_count = np.zeros(self.hparams.pred_shape)
+        # self.backbone=SegModel(model_depth=50)
+        self.loss_func1 = smp.losses.DiceLoss(mode='binary')
+        # self.loss_func2= smp.losses.FocalLoss(mode='binary',gamma=2)
+        self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.15)
+        # self.loss_func=nn.HuberLoss(delta=5.0)
+        self.loss_func= lambda x,y:0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
+        
+        print("model choice: ", self.hparams.enc)
+        
+        # self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=700)
+        if self.hparams.enc=='resnet34':
+            self.backbone = generate_model(model_depth=34, n_input_channels=1,forward_features=True,n_classes=700)
+            state_dict=torch.load('./r3d34_K_200ep.pth')["state_dict"]
+            conv1_weight = state_dict['conv1.weight']
+            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
+            self.backbone.load_state_dict(state_dict,strict=False)
+        elif self.hparams.enc=='resnest101':
+            self.backbone = generate_model(model_depth=101, n_input_channels=1,forward_features=True,n_classes=1039)
+            state_dict=torch.load('./r3d101_KM_200ep.pth')["state_dict"]
+            conv1_weight = state_dict['conv1.weight']
+            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
+            self.backbone.load_state_dict(state_dict,strict=False)
+        elif self.hparams.enc=='2p1d':
+            self.backbone = generate_2p1d(model_depth=34, n_input_channels=1,n_classes=700)
+            state_dict=torch.load('./r2p1d34_K_200ep.pth')["state_dict"]
+            conv1_weight = state_dict['conv1_s.weight']
+            state_dict['conv1_s.weight'] = conv1_weight.sum(dim=1, keepdim=True)
+            self.backbone.load_state_dict(state_dict,strict=False)
+        elif self.hparams.enc=='wide50':
+            self.backbone = generate_wide(model_depth=50, n_input_channels=1,n_classes=700,forward_features=True,k=2)
+        elif self.hparams.enc=='i3d':
+            self.backbone=InceptionI3d(in_channels=1,num_classes=512,non_local=True)
+        elif self.hparams.enc=='resnext101':
+            self.backbone=resnext101(sample_size=112,
+                                  sample_duration=16,
+                                  shortcut_type='B',
+                                  cardinality=32,
+                                  num_classes=600)
+            state_dict = torch.load('./kinetics_resnext_101_RGB_16_best.pth')['state_dict']
+            checkpoint_custom = OrderedDict()
+            for key_model, key_checkpoint in zip(self.backbone.state_dict().keys(), state_dict.keys()):
+                checkpoint_custom.update({f'{key_model}': state_dict[f'{key_checkpoint}']})
+
+            self.backbone.load_state_dict(checkpoint_custom, strict=True)
+            self.backbone.conv1 = nn.Conv3d(1, 64, kernel_size=(7, 7, 7), stride=(1, 2, 2), padding=(3, 3, 3), bias=False)
+        else:
+            self.backbone = generate_model(model_depth=50, n_input_channels=1,forward_features=True,n_classes=700)
+            state_dict=torch.load('./r3d50_K_200ep.pth')["state_dict"]
+            conv1_weight = state_dict['conv1.weight']
+            state_dict['conv1.weight'] = conv1_weight.sum(dim=1, keepdim=True)
+            self.backbone.load_state_dict(state_dict,strict=False)
+        
+        self.decoder = Decoder(encoder_dims=[x.size(1) for x in self.backbone(torch.rand(1,1,20,256,256))], upscale=1)
+
+        if self.hparams.with_norm:
+            self.normalization=nn.BatchNorm3d(num_features=1)
+    def forward(self, x):
+        if x.ndim==4:
+            x=x[:,None]
+        if self.hparams.with_norm:
+            x=self.normalization(x)
+        feat_maps = self.backbone(x)
+        feat_maps_pooled = [torch.max(f, dim=2)[0] for f in feat_maps]
+        pred_mask = self.decoder(feat_maps_pooled)
+        
+        return pred_mask
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        outputs = self(x)
+        loss1 = self.loss_func(outputs, y)
+        if torch.isnan(loss1):
+            print("Loss nan encountered")
+        self.log("train/Arcface_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
+        return {"loss": loss1}
+
+    def validation_step(self, batch, batch_idx):
+        x,y,xyxys= batch
+        batch_size = x.size(0)
+        outputs = self(x)
+        loss1 = self.loss_func(outputs, y)
+        y_preds = torch.sigmoid(outputs).to('cpu')
+        for i, (x1, y1, x2, y2) in enumerate(xyxys):
+            self.mask_pred[y1:y2, x1:x2] += F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy()
+            self.mask_count[y1:y2, x1:x2] += np.ones((self.hparams.size, self.hparams.size))
+
+        self.log("val/MSE_loss", loss1.item(),on_step=True, on_epoch=True, prog_bar=True)
+        return {"loss": loss1}
     
+    def on_validation_epoch_end(self):
+        self.mask_pred = np.divide(self.mask_pred, self.mask_count, out=np.zeros_like(self.mask_pred), where=self.mask_count!=0)
+        wandb_logger.log_image(key="masks", images=[np.clip(self.mask_pred,0,1)], caption=["probs"])
+
+        #reset mask
+        self.mask_pred = np.zeros(self.hparams.pred_shape)
+        self.mask_count = np.zeros(self.hparams.pred_shape)
+    def configure_optimizers(self):
+        optimizer = AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=CFG.lr)    
+        scheduler = get_scheduler(CFG, optimizer)
+        return [optimizer]
+
 class RegressionPLModel(LightningModule):
     def __init__(self,pred_shape,size=64,enc='',with_norm=False):
         super(RegressionPLModel, self).__init__()
@@ -235,6 +371,7 @@ class RegressionPLModel(LightningModule):
                 attn_dropout = 0.1,
                 ff_dropout = 0.1
             )
+        self.output_sd = 16
         if self.hparams.with_norm:
             self.normalization=nn.BatchNorm3d(num_features=1)
 
@@ -284,10 +421,10 @@ def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
 
         # Update mask_pred and mask_count in a batch manner
         for i, (x1, y1, x2, y2) in enumerate(xys):
-            xs1 = x1//16*args.sr+F1
-            ys1 = y1//16*args.sr+F1
-            xs2 = x2//16*args.sr-F2
-            ys2 = y2//16*args.sr-F2
+            xs1 = x1//model.output_sd*args.sr+F1
+            ys1 = y1//model.output_sd*args.sr+F1
+            xs2 = x2//model.output_sd*args.sr-F2
+            ys2 = y2//model.output_sd*args.sr-F2
             if args.median:
                 subx = x1//CFG.stride % sub_steps
                 suby = y1//CFG.stride % sub_steps
@@ -306,7 +443,10 @@ import gc
 
 if __name__ == "__main__":
     # Loading the model
-    model = RegressionPLModel.load_from_checkpoint(args.model_path, strict=False)
+    try:
+        model = RegressionPLModel.load_from_checkpoint(args.model_path, strict=True)
+    except: 
+        model = RegressionPLManyModels.load_from_checkpoint(args.model_path, strict=False)
     model.to(device)
     
     if args.compile:
@@ -318,7 +458,7 @@ if __name__ == "__main__":
     
     model.eval()
 
-    img_split = get_img_splits(args.start_idx,args.stop_idx)
+    img_split = get_img_splits(args.start_idx,args.stop_idx,model.output_sd)
     test_loader,test_xyxz,test_shape = img_split
     
     mask_pred = predict_fn(test_loader, model, device, test_xyxz, test_shape)
